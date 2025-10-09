@@ -15,7 +15,7 @@ COPY templates/ ./templates/.
 
 # Expose the port (Flask default)
 EXPOSE 8080
-VOLUME /app
+VOLUME /app/data
 
 # Command to run the application (using gunicorn for production stability)
 CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8080","--log-level", "info", "--access-logfile", "-", "--error-logfile", "-", "timelapse_app:app"]

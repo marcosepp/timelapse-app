@@ -112,7 +112,7 @@ Before running the application, you need to create a Dropbox API app:
     docker run -d \
       --name timelapse-service \
       -p 8080:8080 \
-      -v "$(pwd)/data:/app" \
+      -v "$(pwd)/data:/app/data" \
       -e FLASK_SECRET_KEY="your_super_secret_key_here" \
       -e TZ="America/New_York" \
       dropbox-timelapse-app
@@ -156,7 +156,7 @@ Before running the application, you need to create a Dropbox API app:
 
 ## Database
 
-The application uses an SQLite database named `timelapse.db` to store its configuration and Dropbox tokens. When deploying with Docker, ensure you mount a volume for the `/app` directory (or specifically the `timelapse.db` file) to persist this data.
+The application uses an SQLite database named `timelapse.db` to store its configuration and Dropbox tokens. When deploying with Docker, ensure you mount a volume for the `/app/data` directory (or specifically the `timelapse.db` file) to persist this data.
 
 ## Contributing
 

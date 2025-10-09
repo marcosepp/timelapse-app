@@ -36,7 +36,7 @@ from sqlalchemy.orm import sessionmaker
 
 # --- Configuration and Initialization ---
 # The database file must be stored on a stateful volume when running in Docker
-DB_FILE = "/app/data/timelapse.db"
+DB_FILE = "/data/timelapse.db"
 DATABASE_URL = f"sqlite://{DB_FILE}"
 
 # Set up logging
