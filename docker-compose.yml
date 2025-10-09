@@ -1,0 +1,19 @@
+services:
+
+  timelapse:
+    networks:
+      - timelapse_network
+    build: .
+    ports:
+      - '8080:8080'
+    volumes:
+      - timelapse_data:/data
+    environment:
+      - TZ="Europe/Tallinn"
+
+volumes:
+  timelapse_data:
+
+networks:
+  timelapse_network:
+    name: "timelapse_network"

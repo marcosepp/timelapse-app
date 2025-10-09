@@ -1,0 +1,8 @@
+.venv/
+.github/
+.gitignore
+.dockerignore
+test_rtsp/
+docker-compose.yml
+Dockerfile
+README.md

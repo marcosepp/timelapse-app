@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Timelapse App Configuration</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
+        xintegrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <!-- Inter Font -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8f9fa;
+        }
+
+        .card {
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+        }
+
+        .btn-action {
+            width: 100%;
+        }
+
+        .status-badge {
+            transition: all 0.3s ease;
+        }
+
+        .form-control:disabled {
+            background-color: #e9ecef;
+        }
+
+        .container {
+            max-width: 800px;
+        }
+    </style>
+    <!-- Tailwind CSS (for rounded corners, etc.) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="p-4">
+
+    <div class="container my-5">
+        <h1 class="text-3xl font-bold text-center mb-5 text-gray-800">Dropbox Timelapse Service</h1>
+
+        <!-- Status Card -->
+        <div class="card mb-4">
+            <div class="card-body">
+                <h5 class="card-title text-xl font-semibold mb-3">Service Status</h5>
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <span id="status-indicator"
+                            class="badge text-bg-secondary status-badge fs-6 rounded-pill p-2 me-3">LOADING</span>
+                        <span class="text-sm text-gray-600" id="user-info">Dropbox User ID: N/A</span>
+                    </div>
+                    <div id="auth-status">
+                        <span class="badge text-bg-danger rounded-pill p-2">NOT AUTHORIZED</span>
+                    </div>
+                </div>
+                <p id="last-status" class="mt-3 mb-0 text-sm text-gray-700">Checking service state...</p>
+            </div>
+        </div>
+
+        <!-- Configuration Card -->
+        <div class="card mb-4">
+            <div class="card-body">
+                <h5 class="card-title text-xl font-semibold mb-3">Configuration</h5>
+
+                <form id="config-form">
+                    <fieldset id="config-fields">
+
+                        <h6 class="text-md font-medium text-gray-700 mt-4 mb-2">Timelapse Settings</h6>
+
+                        <div class="mb-3">
+                            <label for="interval_seconds" class="form-label">Interval (seconds)</label>
+                            <input type="number" class="form-control rounded-lg" id="interval_seconds"
+                                name="interval_seconds" required min="5">
+                            <div class="form-text">How often to call the API (e.g., 300 for 5 minutes). Minimum 5
+                                seconds.</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="api_url" class="form-label">Image API URL</label>
+                            <input type="url" class="form-control rounded-lg" id="api_url" name="api_url" required>
+                            <div class="form-text">URL that returns a JPEG image file when called.</div>
+                        </div>
+
+                        <h6 class="text-md font-medium text-gray-700 mt-4 mb-2">Dropbox Settings</h6>
+
+                        <div class="mb-3">
+                            <label for="dropbox_folder" class="form-label">Dropbox Folder Path</label>
+                            <input type="text" class="form-control rounded-lg" id="dropbox_folder" name="dropbox_folder"
+                                required>
+                            <div class="form-text">Example: <code>/My Projects/Timelapse</code></div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="app_id" class="form-label">Dropbox OAuth Application ID (Client ID)</label>
+                            <input type="text" class="form-control rounded-lg" id="app_id" name="app_id" required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="app_secret" class="form-label">Dropbox OAuth Application Secret (Client
+                                Secret)</label>
+                            <!-- Note: type="text" is used as requested to show secrets -->
+                            <input type="text" class="form-control rounded-lg" id="app_secret" name="app_secret"
+                                required>
+                        </div>
+
+                    </fieldset>
+
+                    <div id="auth-section" class="mt-4 p-3 border rounded-lg bg-light d-grid gap-2">
+                        <p class="mb-2 text-sm text-gray-600">You must click "Save Configuration" before authorizing for
+                            the first time.</p>
+                        <button type="button" id="authorize-btn" class="btn btn-warning rounded-lg">Authorize Dropbox
+                            Access</button>
+                    </div>
+
+                    <div class="d-grid gap-2 mt-4">
+                        <button type="submit" id="save-config-btn" class="btn btn-primary rounded-lg shadow-sm">Save
+                            Configuration</button>
+                    </div>
+                </form>
+
+                <div class="d-flex justify-content-between mt-4 pt-3 border-top">
+                    <button type="button" id="delete-config-btn" class="btn btn-outline-danger btn-sm rounded-lg">Delete
+                        Configuration</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls Card -->
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title text-xl font-semibold mb-3">Service Controls</h5>
+                <div class="d-grid gap-2 d-md-flex justify-content-md-start">
+                    <button type="button" id="start-btn"
+                        class="btn btn-success btn-lg rounded-lg shadow-lg btn-action">Start Timelapse</button>
+                    <button type="button" id="stop-btn" class="btn btn-danger btn-lg rounded-lg shadow-lg btn-action"
+                        disabled>Stop Timelapse</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Custom Message Box -->
+        <div id="message-box" class="position-fixed bottom-0 end-0 p-3" style="z-index: 1000;">
+            <div id="liveToast" class="toast hide" role="alert" aria-live="assertive" aria-atomic="true">
+                <div class="toast-header">
+                    <strong class="me-auto" id="toast-title">Message</strong>
+                    <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+                <div class="toast-body" id="toast-body"></div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        xintegrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+        crossorigin="anonymous"></script>
+
+    <script>
+        const configForm = document.getElementById('config-form');
+        const configFields = document.getElementById('config-fields');
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const authorizeBtn = document.getElementById('authorize-btn');
+        const deleteBtn = document.getElementById('delete-config-btn');
+        const statusIndicator = document.getElementById('status-indicator');
+        const lastStatusText = document.getElementById('last-status');
+        const authStatusDiv = document.getElementById('auth-status');
+        const userInfoSpan = document.getElementById('user-info');
+        const saveConfigBtn = document.getElementById('save-config-btn');
+
+        let isConfigLoaded = false; // Flag to ensure config is loaded only once
+
+        // --- Utility Functions ---
+
+        function showMessage(title, body, type = 'primary') {
+            const toastElement = document.getElementById('liveToast');
+            const toastTitle = document.getElementById('toast-title');
+            const toastBody = document.getElementById('toast-body');
+
+            toastTitle.textContent = title;
+            toastBody.textContent = body;
+
+            // Remove previous color classes and add the new one
+            toastElement.className = 'toast hide';
+            toastElement.classList.add('text-bg-' + type);
+
+            const toast = new bootstrap.Toast(toastElement);
+            toast.show();
+        }
+
+        async function apiCall(endpoint, method = 'GET', data = null) {
+            try {
+                const options = {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                };
+                if (data) {
+                    options.body = JSON.stringify(data);
+                }
+
+                const response = await fetch(endpoint, options);
+                const result = await response.json();
+
+                if (!response.ok) {
+                    showMessage('Error', result.message || `Failed to ${method} ${endpoint}`, 'danger');
+                    return null;
+                }
+
+                return result;
+
+            } catch (error) {
+                showMessage('Network Error', 'Could not connect to the service.', 'danger');
+                console.error('API Call Failed:', error);
+                return null;
+            }
+        }
+
+        // --- Core Logic ---
+
+        function updateUI(status) {
+            const isRunning = status.is_running;
+            const isAuthorized = status.is_authenticated;
+
+            // 1. Controls State
+            startBtn.disabled = isRunning || !isAuthorized;
+            stopBtn.disabled = !isRunning;
+
+            // 2. Configuration Edit State
+            const isDisabled = isRunning;
+            Array.from(configFields.elements).forEach(el => {
+                el.disabled = isDisabled;
+            });
+            saveConfigBtn.disabled = isDisabled;
+            deleteBtn.disabled = isDisabled;
+
+            // 3. Status Indicator
+            statusIndicator.textContent = isRunning ? 'RUNNING' : 'STOPPED';
+            statusIndicator.className = `badge text-bg-${status.status_code} status-badge fs-6 rounded-pill p-2 me-3`;
+            lastStatusText.textContent = status.status;
+
+            // 4. Authorization Status
+            userInfoSpan.textContent = `Dropbox User ID: ${status.user_id}`;
+            if (isAuthorized) {
+                authStatusDiv.innerHTML = `<span class="badge text-bg-success rounded-pill p-2">AUTHORIZED</span>`;
+                authorizeBtn.textContent = "Re-Authorize Dropbox Access";
+                authorizeBtn.classList.remove('btn-warning');
+                authorizeBtn.classList.add('btn-secondary');
+            } else {
+                authStatusDiv.innerHTML = `<span class="badge text-bg-danger rounded-pill p-2">NOT AUTHORIZED</span>`;
+                authorizeBtn.textContent = "Authorize Dropbox Access";
+                authorizeBtn.classList.add('btn-warning');
+                authorizeBtn.classList.remove('btn-secondary');
+            }
+        }
+
+        function loadConfigValues(config) {
+            // Only set form values once on initial load to avoid clearing user input
+            document.getElementById('interval_seconds').value = config.interval_seconds;
+            document.getElementById('api_url').value = config.api_url;
+            document.getElementById('dropbox_folder').value = config.dropbox_folder;
+            document.getElementById('app_id').value = config.app_id;
+            document.getElementById('app_secret').value = config.app_secret;
+            isConfigLoaded = true;
+        }
+
+        async function updateStatusAndUI() {
+            const status = await apiCall('/status');
+            if (status) {
+                updateUI(status);
+
+                // IMPORTANT: Load config values only once upon initial load
+                if (!isConfigLoaded) {
+                    loadConfigValues(status.config);
+                }
+            }
+        }
+
+        // --- Event Listeners ---
+
+        // Start Service
+        startBtn.addEventListener('click', async () => {
+            const result = await apiCall('/start', 'POST');
+            if (result && result.success) {
+                showMessage('Service', result.message, 'success');
+                updateStatusAndUI();
+            }
+        });
+
+        // Stop Service
+        stopBtn.addEventListener('click', async () => {
+            const result = await apiCall('/stop', 'POST');
+            if (result && result.success) {
+                showMessage('Service', result.message, 'danger');
+                updateStatusAndUI();
+            }
+        });
+
+        // Save Configuration
+        configForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(configForm);
+            const data = Object.fromEntries(formData.entries());
+
+            // Simple validation
+            if (parseInt(data.interval_seconds) < 5) {
+                showMessage('Validation Error', 'Interval must be 5 seconds or more.', 'danger');
+                return;
+            }
+
+            const result = await apiCall('/config', 'POST', data);
+            if (result) {
+                if (result.success) {
+                    showMessage('Config Saved', result.message, 'primary');
+                }
+                updateStatusAndUI();
+            }
+        });
+
+        // Delete Configuration
+        deleteBtn.addEventListener('click', async () => {
+            // Use a custom modal or message box instead of confirm()
+            const confirmation = window.prompt("Type 'DELETE' to confirm you want to delete ALL configuration and tokens. This will stop the service.");
+
+            if (confirmation === 'DELETE') {
+                const result = await apiCall('/config_delete', 'POST');
+                if (result && result.success) {
+                    showMessage('Config Deleted', result.message, 'secondary');
+                    // Reset the config loaded flag so it loads defaults from the API again
+                    isConfigLoaded = false;
+                    updateStatusAndUI();
+                }
+            } else if (confirmation !== null) {
+                showMessage('Deletion Canceled', 'Configuration was not deleted.', 'info');
+            }
+        });
+
+        // Handle OAuth Authorization Redirect
+        authorizeBtn.addEventListener('click', async () => {
+            const configData = {
+                interval_seconds: document.getElementById('interval_seconds').value,
+                api_url: document.getElementById('api_url').value,
+                dropbox_folder: document.getElementById('dropbox_folder').value,
+                app_id: document.getElementById('app_id').value,
+                app_secret: document.getElementById('app_secret').value
+            };
+
+            // First, ensure the current config is saved
+            const saveResult = await apiCall('/config', 'POST', configData);
+            if (!saveResult || !saveResult.success) return;
+
+            // Second, get the Dropbox authorization URL
+            const authResult = await apiCall('/dropbox_callback', 'POST');
+
+            if (authResult && authResult.success) {
+                showMessage('Authorizing', 'Redirecting to Dropbox for authorization...', 'info');
+                // Redirect the user to Dropbox
+                window.location.href = authResult.auth_url;
+            }
+        });
+
+        // --- Initialization ---
+
+        window.onload = () => {
+            // NOTE: updateStatusAndUI handles the initial loading of both status and config values
+            updateStatusAndUI();
+            // Poll for status updates every 5 seconds
+            setInterval(updateStatusAndUI, 5000);
+        };
+    </script>
+</body>
+
+</html>
