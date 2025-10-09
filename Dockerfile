@@ -7,7 +7,7 @@ WORKDIR /app
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && mkdir templates
+    && mkdir templates data
 
 # Copy the application code
 COPY timelapse_app.py .
