@@ -4,12 +4,13 @@ services:
     networks:
       - timelapse_network
     build: .
+    #image: ghcr.io/marcosepp/timelapse-app:main
     ports:
       - '8080:8080'
     volumes:
-      - timelapse_data:/data
+      - timelapse_data:/app
     environment:
-      - TZ="Europe/Tallinn"
+      TZ: "Europe/Tallinn"
 
 volumes:
   timelapse_data:
