@@ -428,7 +428,11 @@ def dropbox_callback() -> tuple[Response, int] | Response:
         flow = dropbox.DropboxOAuth2Flow(
             consumer_key=config.app_id,
             consumer_secret=config.app_secret,
-            redirect_uri=url_for("config_save", _external=True),
+            redirect_uri=url_for(
+                "config_save",
+                _external=True,
+                _scheme="https",
+            ),
             session=session,
             csrf_token_session_key=CSRF_TOKEN_SESSION_KEY,
             token_access_type="offline",  # noqa: S106
@@ -470,7 +474,11 @@ def config_save():
             flow = dropbox.DropboxOAuth2Flow(
                 consumer_key=config.app_id,
                 consumer_secret=config.app_secret,
-                redirect_uri=url_for("config_save", _external=True),
+                redirect_uri=url_for(
+                    "config_save",
+                    _external=True,
+                    _scheme="https",
+                ),
                 session=session,
                 csrf_token_session_key=CSRF_TOKEN_SESSION_KEY,
                 token_access_type="offline",  # noqa: S106
