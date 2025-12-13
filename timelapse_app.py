@@ -444,11 +444,12 @@ def dropbox_callback() -> tuple[Response, int] | Response:
         return jsonify({"success": True, "auth_url": auth_url})
 
     except Exception as e:
-        logger.exception("Error starting OAuth flow.")
+        msg: str = f"Error starting OAuth flow. {e!s}"
+        logger.exception(msg)
         return jsonify(
             {
                 "success": False,
-                "message": f"Error starting authorization: {e!s}",
+                "message": "An internal error occurred while starting the authorization flow. Check logs for more information.",
             },
         ), 500
 
@@ -575,9 +576,13 @@ def config_save():
 
     except Exception as e:
         session_db.rollback()
-        logger.exception("Failed to save configuration.")
+        msg: str = f"Failed to save configuration. {e!s}"
+        logger.exception(msg)
         return jsonify(
-            {"success": False, "message": f"Error saving config: {e!s}"},
+            {
+                "success": False,
+                "message": "Failed to save configuration. Check logs for more information.",
+            },
         ), 500
 
 
@@ -616,9 +621,13 @@ def config_delete() -> tuple[Response, int] | Response:
         )
     except Exception as e:
         session.rollback()
-        logger.exception("Failed to delete configuration.")
+        msg: str = f"Failed to delete configuration. {e!s}"
+        logger.exception(msg)
         return jsonify(
-            {"success": False, "message": f"Error deleting config: {e!s}"},
+            {
+                "success": False,
+                "message": "An internal error occurred while deleting the configuration. Check logs for more information.",
+            },
         ), 500
 
 
