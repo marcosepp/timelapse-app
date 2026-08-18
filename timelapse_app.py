@@ -654,6 +654,12 @@ def config_save():
             return redirect(url_for("index"))
 
     # 2. Handle standard Configuration Save
+    if request.method != "POST":
+        # A GET here with no code (e.g. Access re-prompted for login mid-redirect
+        # and the OAuth query string didn't survive) isn't a valid save request;
+        # bounce home instead of crashing trying to parse a JSON body that isn't there.
+        return redirect(url_for("index"))
+
     if is_service_active():
         return jsonify(
             {
