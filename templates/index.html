@@ -74,17 +74,40 @@
                         <h6 class="text-md font-medium text-gray-700 mt-4 mb-2">Timelapse Settings</h6>
 
                         <div class="mb-3">
-                            <label for="interval_seconds" class="form-label">Interval (seconds)</label>
-                            <input type="number" class="form-control rounded-lg" id="interval_seconds"
-                                name="interval_seconds" required min="5">
-                            <div class="form-text">How often to call the API (e.g., 300 for 5 minutes). Minimum 5
-                                seconds.</div>
+                            <label for="capture_mode" class="form-label">Capture Mode</label>
+                            <select class="form-select rounded-lg" id="capture_mode" name="capture_mode">
+                                <option value="http_poll">Poll an image API URL (upload each frame as captured)
+                                </option>
+                                <option value="ftp_batch">Watch a folder for files (upload each completed day's
+                                    files as a batch)</option>
+                            </select>
+                            <div class="form-text">Use "Watch a folder" when something else (e.g. a camera's own
+                                built-in FTP timelapse feature) is already dropping images onto disk, and you just
+                                want them pushed to Dropbox once a day.</div>
                         </div>
 
                         <div class="mb-3">
+                            <label for="interval_seconds" class="form-label" id="interval_seconds_label">Interval
+                                (seconds)</label>
+                            <input type="number" class="form-control rounded-lg" id="interval_seconds"
+                                name="interval_seconds" required min="5">
+                            <div class="form-text" id="interval_seconds_help">How often to call the API (e.g., 300
+                                for 5 minutes). Minimum 5 seconds.</div>
+                        </div>
+
+                        <div class="mb-3" id="api_url_group">
                             <label for="api_url" class="form-label">Image API URL</label>
-                            <input type="url" class="form-control rounded-lg" id="api_url" name="api_url" required>
+                            <input type="url" class="form-control rounded-lg" id="api_url" name="api_url">
                             <div class="form-text">URL that returns a JPEG image file when called.</div>
+                        </div>
+
+                        <div class="mb-3" id="ftp_watch_dir_group">
+                            <label for="ftp_watch_dir" class="form-label">Watch Folder Path</label>
+                            <input type="text" class="form-control rounded-lg" id="ftp_watch_dir"
+                                name="ftp_watch_dir">
+                            <div class="form-text">Path inside the container where captured images show up (e.g.
+                                a volume mounted from the same FTP server a camera uploads to). Searched
+                                recursively for <code>.jpg</code>/<code>.jpeg</code> files.</div>
                         </div>
 
                         <h6 class="text-md font-medium text-gray-700 mt-4 mb-2">Dropbox Settings</h6>
@@ -177,6 +200,34 @@
 
         let isConfigLoaded = false; // Flag to ensure config is loaded only once
 
+        const captureModeSelect = document.getElementById('capture_mode');
+        const apiUrlGroup = document.getElementById('api_url_group');
+        const ftpWatchDirGroup = document.getElementById('ftp_watch_dir_group');
+        const apiUrlInput = document.getElementById('api_url');
+        const ftpWatchDirInput = document.getElementById('ftp_watch_dir');
+        const intervalSecondsLabel = document.getElementById('interval_seconds_label');
+        const intervalSecondsHelp = document.getElementById('interval_seconds_help');
+
+        function applyCaptureModeVisibility() {
+            const isFtpBatch = captureModeSelect.value === 'ftp_batch';
+
+            apiUrlGroup.classList.toggle('d-none', isFtpBatch);
+            ftpWatchDirGroup.classList.toggle('d-none', !isFtpBatch);
+
+            apiUrlInput.required = !isFtpBatch;
+            ftpWatchDirInput.required = isFtpBatch;
+
+            if (isFtpBatch) {
+                intervalSecondsLabel.textContent = 'Check Interval (seconds)';
+                intervalSecondsHelp.textContent = 'How often to check the watch folder for a completed day\'s files (e.g. 3600 for hourly). A day\'s files upload once, the first time they\'re seen as complete.';
+            } else {
+                intervalSecondsLabel.textContent = 'Interval (seconds)';
+                intervalSecondsHelp.textContent = 'How often to call the API (e.g., 300 for 5 minutes). Minimum 5 seconds.';
+            }
+        }
+
+        captureModeSelect.addEventListener('change', applyCaptureModeVisibility);
+
         // --- Utility Functions ---
 
         function showMessage(title, body, type = 'primary') {
@@ -267,6 +318,9 @@
             document.getElementById('dropbox_folder').value = config.dropbox_folder;
             document.getElementById('app_id').value = config.app_id;
             document.getElementById('app_secret').value = config.app_secret;
+            captureModeSelect.value = config.capture_mode || 'http_poll';
+            ftpWatchDirInput.value = config.ftp_watch_dir || '/ftp_data';
+            applyCaptureModeVisibility();
             isConfigLoaded = true;
         }
 
@@ -348,7 +402,9 @@
                 api_url: document.getElementById('api_url').value,
                 dropbox_folder: document.getElementById('dropbox_folder').value,
                 app_id: document.getElementById('app_id').value,
-                app_secret: document.getElementById('app_secret').value
+                app_secret: document.getElementById('app_secret').value,
+                capture_mode: captureModeSelect.value,
+                ftp_watch_dir: ftpWatchDirInput.value
             };
 
             // First, ensure the current config is saved

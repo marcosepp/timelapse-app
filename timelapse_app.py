@@ -105,6 +105,12 @@ class Config(Base):
     is_active = Column(Boolean, default=False)
     last_status = Column(String, default="Stopped.")
     last_run_time = Column(DateTime, default=datetime.now(timezone.utc))
+    # "http_poll" (original behavior: poll api_url every interval_seconds and
+    # upload each frame individually) or "ftp_batch" (watch ftp_watch_dir for
+    # files dropped by an external process, e.g. a camera's own FTP timelapse
+    # feature, and upload each completed day's files as a batch).
+    capture_mode = Column(String, default="http_poll")
+    ftp_watch_dir = Column(String, default="/ftp_data")
 
 
 class Token(Base):
@@ -118,10 +124,41 @@ class Token(Base):
     user_id = Column(String)  # Dropbox user ID
 
 
+class UploadedCapture(Base):
+    """Tracks ftp_batch files already uploaded, so a retried/resumed batch
+    doesn't re-upload files that already made it to Dropbox.
+    """
+
+    __tablename__ = "uploaded_capture"
+    id = Column(Integer, primary_key=True)
+    file_path = Column(String, unique=True, nullable=False)
+    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+def _migrate_schema() -> None:
+    """Add columns introduced after the initial release, so an existing
+    timelapse.db from before ftp_batch mode still loads correctly.
+    """
+    with engine.connect() as conn:
+        existing_cols = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(config)")
+        }
+        if "capture_mode" not in existing_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE config ADD COLUMN capture_mode VARCHAR DEFAULT 'http_poll'",
+            )
+        if "ftp_watch_dir" not in existing_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE config ADD COLUMN ftp_watch_dir VARCHAR DEFAULT '/ftp_data'",
+            )
+        conn.commit()
+
+
 # Initialize database and ensure the single config row exists
 def init_db() -> None:
     """Initialize the database and ensures a single config row is present."""
     Base.metadata.create_all(engine)
+    _migrate_schema()
 
     # Use a local session for initialization to keep it separate from the global db_session
     # which is mainly for the background thread.
@@ -240,6 +277,95 @@ def update_status(status_message: str, is_active: bool | None = None):
         local_session.close()
 
 
+def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
+    """Scan ftp_watch_dir for files from completed (non-today) days and
+    batch-upload any not already uploaded to Dropbox. Today's files are left
+    alone since that day's capture isn't finished yet. Designed to be called
+    on every tick of the main loop; it's a no-op once a day's files are done.
+    """
+    watch_dir = Path(str(config.ftp_watch_dir))
+    dbx_folder = str(config.dropbox_folder)
+
+    if not watch_dir.is_dir():
+        update_status(
+            f"FTP watch directory not found: {watch_dir}",
+            is_active=True,
+        )
+        return
+
+    today = datetime.now(tz=APP_TIMEZONE).date()
+
+    local_session = Session()
+    try:
+        already_uploaded = {
+            row.file_path for row in local_session.query(UploadedCapture).all()
+        }
+
+        pending_by_date: dict[str, list[Path]] = {}
+        for image_path in watch_dir.rglob("*"):
+            if (
+                not image_path.is_file()
+                or image_path.suffix.lower() not in (".jpg", ".jpeg")
+                or str(image_path) in already_uploaded
+            ):
+                continue
+
+            file_date = datetime.fromtimestamp(
+                image_path.stat().st_mtime,
+                tz=APP_TIMEZONE,
+            ).date()
+            if file_date >= today:
+                # Still being written to by the capture source; wait for it to finish.
+                continue
+
+            pending_by_date.setdefault(file_date.isoformat(), []).append(
+                image_path,
+            )
+
+        if not pending_by_date:
+            update_status(
+                "No completed day's captures pending upload.",
+                is_active=True,
+            )
+            return
+
+        # Get Dropbox Session (handles token refresh) only once real work exists.
+        dbx = get_dropbox_session(config, token)
+
+        for date_str, files in sorted(pending_by_date.items()):
+            update_status(
+                f"Batch uploading {len(files)} image(s) for {date_str}...",
+                is_active=True,
+            )
+            uploaded_count = 0
+            for image_path in files:
+                dropbox_path = str(
+                    Path(dbx_folder) / date_str / image_path.name,
+                ).replace("\\", "/")
+                try:
+                    dbx.files_upload(
+                        f=image_path.read_bytes(),
+                        path=dropbox_path,
+                        mode=dropbox.files.WriteMode.add,
+                    )
+                    local_session.add(UploadedCapture(file_path=str(image_path)))
+                    local_session.commit()
+                    uploaded_count += 1
+                except dropbox.exceptions.ApiError as e:
+                    logger.exception(f"Dropbox upload failed for {image_path}")
+                    update_status(
+                        f"Dropbox Upload Error for {image_path.name}: {e}",
+                        is_active=True,
+                    )
+                    # Leave unmarked so this file is retried on the next cycle.
+
+            status_msg = f"SUCCESS: Batch upload for {date_str} complete ({uploaded_count}/{len(files)})."
+            update_status(status_msg, is_active=True)
+            logger.info(status_msg)
+    finally:
+        local_session.close()
+
+
 def timelapse_job():
     """Run main background loop for fetching and uploading images."""
     logger.info("Timelapse background service started.")
@@ -256,63 +382,69 @@ def timelapse_job():
                 db_session.refresh(token)
 
             interval = config.interval_seconds
-            api_url = str(config.api_url)
-            dbx_folder = str(config.dropbox_folder)
+            capture_mode = str(config.capture_mode or "http_poll")
 
-            update_status(
-                f"Attempting image fetch from {api_url}...",
-                is_active=True,
-            )
+            if capture_mode == "ftp_batch":
+                _run_ftp_batch_cycle(config, token)
 
-            # 1. Get Dropbox Session (handles token refresh)
-            dbx = get_dropbox_session(config, token)
+            else:
+                api_url = str(config.api_url)
+                dbx_folder = str(config.dropbox_folder)
 
-            # 2. Fetch Image
-            try:
-                response = requests.get(api_url, timeout=30)
-                response.raise_for_status()
+                update_status(
+                    f"Attempting image fetch from {api_url}...",
+                    is_active=True,
+                )
 
-                content_type = response.headers.get("Content-Type", "")
-                # Be flexible with image content types
-                if "image" not in content_type:
-                    raise Exception(
-                        f"API returned invalid content type: {content_type}",
+                # 1. Get Dropbox Session (handles token refresh)
+                dbx = get_dropbox_session(config, token)
+
+                # 2. Fetch Image
+                try:
+                    response = requests.get(api_url, timeout=30)
+                    response.raise_for_status()
+
+                    content_type = response.headers.get("Content-Type", "")
+                    # Be flexible with image content types
+                    if "image" not in content_type:
+                        raise Exception(
+                            f"API returned invalid content type: {content_type}",
+                        )
+
+                    image_data = response.content
+                    file_name = f"timelapse_{datetime.now(tz=APP_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.jpg"
+                    dropbox_path = str(Path(dbx_folder) / file_name).replace(
+                        "\\",
+                        "/",
                     )
 
-                image_data = response.content
-                file_name = f"timelapse_{datetime.now(tz=APP_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.jpg"
-                dropbox_path = str(Path(dbx_folder) / file_name).replace(
-                    "\\",
-                    "/",
-                )
+                except requests.exceptions.RequestException as e:
+                    update_status(f"API Connection Error: {e}", is_active=True)
+                    logger.exception("API Connection Error.")
 
-            except requests.exceptions.RequestException as e:
-                update_status(f"API Connection Error: {e}", is_active=True)
-                logger.exception("API Connection Error.")
+                    # Sleep for 1/10th of interval if an error occurs, to avoid hammering the DB/API
+                    stop_event.wait(interval / 10 if interval > 10 else 1)
+                    continue
 
-                # Sleep for 1/10th of interval if an error occurs, to avoid hammering the DB/API
-                stop_event.wait(interval / 10 if interval > 10 else 1)
-                continue
+                # 3. Upload Image to Dropbox
+                try:
+                    # Use WriteMode.add to ensure unique files and avoid conflicts
+                    dbx.files_upload(
+                        f=image_data,
+                        path=dropbox_path,
+                        mode=dropbox.files.WriteMode.add,
+                    )
 
-            # 3. Upload Image to Dropbox
-            try:
-                # Use WriteMode.add to ensure unique files and avoid conflicts
-                dbx.files_upload(
-                    f=image_data,
-                    path=dropbox_path,
-                    mode=dropbox.files.WriteMode.add,
-                )
+                    status_msg = f"SUCCESS: Uploaded '{file_name}' to Dropbox."
+                    update_status(status_msg, is_active=True)
+                    logger.info(status_msg)
 
-                status_msg = f"SUCCESS: Uploaded '{file_name}' to Dropbox."
-                update_status(status_msg, is_active=True)
-                logger.info(status_msg)
-
-            except dropbox.exceptions.ApiError as e:
-                update_status(f"Dropbox Upload Error: {e}", is_active=True)
-                logger.exception("Dropbox Upload Error.")
-            except Exception as e:
-                update_status(f"Unknown Upload Error: {e}", is_active=True)
-                logger.exception("Unknown Upload Error.")
+                except dropbox.exceptions.ApiError as e:
+                    update_status(f"Dropbox Upload Error: {e}", is_active=True)
+                    logger.exception("Dropbox Upload Error.")
+                except Exception as e:
+                    update_status(f"Unknown Upload Error: {e}", is_active=True)
+                    logger.exception("Unknown Upload Error.")
 
         except Exception as e:
             update_status(
@@ -538,12 +670,23 @@ def config_save():
         app_id_changed = config.app_id != data.get("app_id")
         app_secret_changed = config.app_secret != data.get("app_secret")
 
+        capture_mode = data.get("capture_mode") or "http_poll"
+        if capture_mode not in ("http_poll", "ftp_batch"):
+            return jsonify(
+                {
+                    "success": False,
+                    "message": "capture_mode must be 'http_poll' or 'ftp_batch'.",
+                },
+            ), 400
+
         # Update config fields
         config.interval_seconds = int(data.get("interval_seconds"))
         config.api_url = data.get("api_url")
         config.dropbox_folder = data.get("dropbox_folder")
         config.app_id = data.get("app_id")
         config.app_secret = data.get("app_secret")
+        config.capture_mode = capture_mode
+        config.ftp_watch_dir = data.get("ftp_watch_dir") or "/ftp_data"
 
         # Clear tokens if credentials changed (forcing re-auth)
         if app_id_changed or app_secret_changed:
@@ -728,6 +871,8 @@ def get_status() -> Response:
                 "dropbox_folder": config.dropbox_folder if config else "",
                 "app_id": config.app_id if config else "",
                 "app_secret": config.app_secret if config else "",
+                "capture_mode": config.capture_mode if config else "http_poll",
+                "ftp_watch_dir": config.ftp_watch_dir if config else "/ftp_data",
             },
             "status": display_status,
             "status_code": status_code,
