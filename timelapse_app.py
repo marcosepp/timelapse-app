@@ -449,9 +449,16 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
         dbx = None  # lazily created only once real work exists
 
         # --- 2. Upload: anything reserved but not yet uploaded, oldest first.
+        # sequence_number.isnot(None) excludes legacy rows created before this
+        # per-file pipeline existed (migrated in with sequence_number=NULL) --
+        # those predate frame numbering entirely and are intentionally left
+        # untouched, not retrofitted.
         pending_rows = (
             local_session.query(UploadedCapture)
-            .filter(UploadedCapture.uploaded_at.is_(None))
+            .filter(
+                UploadedCapture.uploaded_at.is_(None),
+                UploadedCapture.sequence_number.isnot(None),
+            )
             .order_by(UploadedCapture.sequence_number)
             .all()
         )
@@ -491,11 +498,13 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
         # --- 3. Verify + delete: anything uploaded whose local copy is
         # still sitting on disk. Bounded to files currently in the watch
         # dir, not every uploaded row ever, so this stays cheap for the
-        # life of a long deployment.
+        # life of a long deployment. sequence_number.isnot(None) excludes
+        # legacy pre-migration rows -- see Phase 2 comment above.
         uploaded_rows = (
             local_session.query(UploadedCapture)
             .filter(
                 UploadedCapture.uploaded_at.isnot(None),
+                UploadedCapture.sequence_number.isnot(None),
                 UploadedCapture.file_path.in_(capture_files.keys()),
             )
             .all()
@@ -541,12 +550,14 @@ def timelapse_job():
     """Run main background loop for fetching and uploading images."""
     logger.info("Timelapse background service started.")
 
-    while not stop_event.is_set():
-        # Retrieve config and token from the global session for the background job
-        config = db_session.query(Config).first()
-        token = db_session.query(Token).first()
+    interval = 300  # fallback if an exception hits before config is ever loaded
 
+    while not stop_event.is_set():
         try:
+            # Retrieve config and token from the global session for the background job
+            config = db_session.query(Config).first()
+            token = db_session.query(Token).first()
+
             if not config or not token:
                 raise Exception("Configuration or Token records are missing.")
             if token:
@@ -618,11 +629,12 @@ def timelapse_job():
                     logger.exception("Unknown Upload Error.")
 
         except Exception as e:
+            db_session.rollback()  # clear any half-open transaction so the next iteration's queries don't fail too
             update_status(
                 f"CRITICAL ERROR: {e}. Check configuration.",
                 is_active=True,
             )
-            logger.critical(f"CRITICAL ERROR in timelapse job: {e}")
+            logger.critical(f"CRITICAL ERROR in timelapse job: {e}", exc_info=True)
             stop_event.wait(5)
 
         # Wait for the defined interval, checking the stop_event periodically
