@@ -277,9 +277,22 @@ def update_status(status_message: str, is_active: bool | None = None):
         local_session.close()
 
 
+def _dropbox_month_folder(date_str: str) -> str:
+    """Convert an ISO date string ('2026-04-18') to this site's monthly
+    Dropbox folder name ('2026-April'). Grouping by month instead of by day
+    means a whole month's images live in one folder, which is much faster to
+    sync/download than paging through one folder per day.
+    """
+    return datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%B")  # noqa: DTZ007
+
+
 def _dropbox_path_for(dbx_folder: str, date_str: str, filename: str) -> str:
-    """Build the Dropbox destination path for one captured file."""
-    return str(Path(dbx_folder) / date_str / filename).replace("\\", "/")
+    """Build the Dropbox destination path for one captured file. Batching
+    and upload-eligibility are still tracked per calendar day (date_str) —
+    only the destination folder is grouped by month.
+    """
+    month_folder = _dropbox_month_folder(date_str)
+    return str(Path(dbx_folder) / month_folder / filename).replace("\\", "/")
 
 
 def _remove_empty_dirs(root: Path) -> None:
