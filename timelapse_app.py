@@ -277,11 +277,39 @@ def update_status(status_message: str, is_active: bool | None = None):
         local_session.close()
 
 
+def _dropbox_path_for(dbx_folder: str, date_str: str, filename: str) -> str:
+    """Build the Dropbox destination path for one captured file."""
+    return str(Path(dbx_folder) / date_str / filename).replace("\\", "/")
+
+
+def _remove_empty_dirs(root: Path) -> None:
+    """Remove now-empty directories under root, deepest first, stopping at
+    root itself. Safe to call anytime; only touches directories with nothing
+    left in them (e.g. after every file in a day's folder was deleted).
+    """
+    for dirpath in sorted(
+        (p for p in root.rglob("*") if p.is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    ):
+        try:
+            dirpath.rmdir()
+        except OSError:
+            pass  # not empty, or a race with something else writing to it
+
+
 def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
     """Scan ftp_watch_dir for files from completed (non-today) days and
     batch-upload any not already uploaded to Dropbox. Today's files are left
     alone since that day's capture isn't finished yet. Designed to be called
-    on every tick of the main loop; it's a no-op once a day's files are done.
+    on every tick of the main loop; it's a no-op once a day's files are
+    uploaded, verified, and deleted.
+
+    Once every file for a given day is uploaded, each one is verified as
+    actually present in Dropbox (files_get_metadata, not just "the upload
+    call didn't raise") before its local copy is deleted — the FTP landing
+    volume is finite storage on the Pi and needs to be reclaimed daily, but
+    deleting a capture that didn't really make it to Dropbox is unrecoverable.
     """
     watch_dir = Path(str(config.ftp_watch_dir))
     dbx_folder = str(config.dropbox_folder)
@@ -301,12 +329,14 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
             row.file_path for row in local_session.query(UploadedCapture).all()
         }
 
-        pending_by_date: dict[str, list[Path]] = {}
+        # Group every completed-day file (uploaded or not) by date, so we can
+        # both upload new ones and re-check older days that uploaded fine
+        # last cycle but didn't get cleaned up (e.g. a crash between the two).
+        files_by_date: dict[str, list[Path]] = {}
         for image_path in watch_dir.rglob("*"):
             if (
                 not image_path.is_file()
                 or image_path.suffix.lower() not in (".jpg", ".jpeg")
-                or str(image_path) in already_uploaded
             ):
                 continue
 
@@ -318,11 +348,11 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
                 # Still being written to by the capture source; wait for it to finish.
                 continue
 
-            pending_by_date.setdefault(file_date.isoformat(), []).append(
+            files_by_date.setdefault(file_date.isoformat(), []).append(
                 image_path,
             )
 
-        if not pending_by_date:
+        if not files_by_date:
             update_status(
                 "No completed day's captures pending upload.",
                 is_active=True,
@@ -332,36 +362,84 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
         # Get Dropbox Session (handles token refresh) only once real work exists.
         dbx = get_dropbox_session(config, token)
 
-        for date_str, files in sorted(pending_by_date.items()):
-            update_status(
-                f"Batch uploading {len(files)} image(s) for {date_str}...",
-                is_active=True,
-            )
-            uploaded_count = 0
-            for image_path in files:
-                dropbox_path = str(
-                    Path(dbx_folder) / date_str / image_path.name,
-                ).replace("\\", "/")
-                try:
-                    dbx.files_upload(
-                        f=image_path.read_bytes(),
-                        path=dropbox_path,
-                        mode=dropbox.files.WriteMode.add,
-                    )
-                    local_session.add(UploadedCapture(file_path=str(image_path)))
-                    local_session.commit()
-                    uploaded_count += 1
-                except dropbox.exceptions.ApiError as e:
-                    logger.exception(f"Dropbox upload failed for {image_path}")
-                    update_status(
-                        f"Dropbox Upload Error for {image_path.name}: {e}",
-                        is_active=True,
-                    )
-                    # Leave unmarked so this file is retried on the next cycle.
+        for date_str, files in sorted(files_by_date.items()):
+            pending = [f for f in files if str(f) not in already_uploaded]
 
-            status_msg = f"SUCCESS: Batch upload for {date_str} complete ({uploaded_count}/{len(files)})."
-            update_status(status_msg, is_active=True)
-            logger.info(status_msg)
+            if pending:
+                update_status(
+                    f"Batch uploading {len(pending)} image(s) for {date_str}...",
+                    is_active=True,
+                )
+                uploaded_count = 0
+                for image_path in pending:
+                    dropbox_path = _dropbox_path_for(
+                        dbx_folder,
+                        date_str,
+                        image_path.name,
+                    )
+                    try:
+                        dbx.files_upload(
+                            f=image_path.read_bytes(),
+                            path=dropbox_path,
+                            mode=dropbox.files.WriteMode.add,
+                        )
+                        local_session.add(
+                            UploadedCapture(file_path=str(image_path)),
+                        )
+                        local_session.commit()
+                        already_uploaded.add(str(image_path))
+                        uploaded_count += 1
+                    except dropbox.exceptions.ApiError as e:
+                        logger.exception(f"Dropbox upload failed for {image_path}")
+                        update_status(
+                            f"Dropbox Upload Error for {image_path.name}: {e}",
+                            is_active=True,
+                        )
+                        # Leave unmarked so this file is retried on the next cycle.
+
+                status_msg = f"SUCCESS: Batch upload for {date_str} complete ({uploaded_count}/{len(pending)})."
+                update_status(status_msg, is_active=True)
+                logger.info(status_msg)
+
+            if not all(str(f) in already_uploaded for f in files):
+                # At least one file for this day still isn't uploaded (a failure
+                # above, most likely) — don't touch local copies, retry next cycle.
+                continue
+
+            # Every file for this day is uploaded — verify each one actually
+            # exists in Dropbox, then delete the local copy to free up the
+            # Pi's storage before the next day's captures need the space.
+            verified_deleted = 0
+            for image_path in files:
+                dropbox_path = _dropbox_path_for(
+                    dbx_folder,
+                    date_str,
+                    image_path.name,
+                )
+                try:
+                    dbx.files_get_metadata(dropbox_path)
+                except dropbox.exceptions.ApiError:
+                    logger.exception(
+                        f"Verification failed for {image_path} at {dropbox_path}; "
+                        "not deleting, will re-check next cycle.",
+                    )
+                    continue
+
+                try:
+                    image_path.unlink()
+                    verified_deleted += 1
+                except OSError:
+                    logger.exception(f"Failed to delete local file {image_path}")
+
+            if verified_deleted:
+                status_msg = (
+                    f"Verified {verified_deleted}/{len(files)} image(s) for {date_str} "
+                    "in Dropbox and deleted the local copies."
+                )
+                update_status(status_msg, is_active=True)
+                logger.info(status_msg)
+
+        _remove_empty_dirs(watch_dir)
     finally:
         local_session.close()
 
