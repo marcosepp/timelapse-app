@@ -30,6 +30,7 @@ from sqlalchemy import (
     Integer,
     String,
     create_engine,
+    func,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -38,6 +39,14 @@ from sqlalchemy.orm import sessionmaker
 # The database file must be stored on a stateful volume when running in Docker
 DB_FILE = "/data/timelapse.db"
 DATABASE_URL = f"sqlite://{DB_FILE}"
+
+# ftp_batch capture mode: a file's mtime must be at least this old before
+# it's considered finished writing (so we never upload a JPEG the camera's
+# FTP client is still mid-transfer on), and this many digits are used to
+# zero-pad its sequence-numbered Dropbox filename (frame_0000001.jpg) --
+# 7 digits comfortably covers a multi-year deployment at a 30s interval.
+FTP_MIN_FILE_AGE_SECONDS = 15
+FTP_SEQUENCE_DIGITS = 7
 
 # Set up logging
 logging.basicConfig(
@@ -108,7 +117,8 @@ class Config(Base):
     # "http_poll" (original behavior: poll api_url every interval_seconds and
     # upload each frame individually) or "ftp_batch" (watch ftp_watch_dir for
     # files dropped by an external process, e.g. a camera's own FTP timelapse
-    # feature, and upload each completed day's files as a batch).
+    # feature, and upload each one shortly after it lands, renamed to a
+    # sequential frame number for editor import).
     capture_mode = Column(String, default="http_poll")
     ftp_watch_dir = Column(String, default="/ftp_data")
 
@@ -125,32 +135,66 @@ class Token(Base):
 
 
 class UploadedCapture(Base):
-    """Tracks ftp_batch files already uploaded, so a retried/resumed batch
-    doesn't re-upload files that already made it to Dropbox.
+    """Tracks each ftp_batch file through two stages: reserved (assigned a
+    sequence_number, uploaded_at still NULL) and uploaded (uploaded_at set).
+    A row is created at reservation time, before any upload is attempted, so
+    that a retry can never cause a later-captured file to end up with a
+    lower frame number than an earlier one still waiting to retry.
     """
 
     __tablename__ = "uploaded_capture"
     id = Column(Integer, primary_key=True)
     file_path = Column(String, unique=True, nullable=False)
-    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # ISO date ("2026-08-18") the file was captured on; drives which Dropbox
+    # month folder it belongs in.
+    capture_date = Column(String)
+    # Drives the frame_NNNNNNN.jpg name uploaded to Dropbox. Assigned once,
+    # at reservation time, and keeps climbing across day/month boundaries
+    # for the life of the deployment so the whole project imports into an
+    # editor as one gap-free image sequence.
+    sequence_number = Column(Integer, unique=True)
+    uploaded_at = Column(DateTime)
 
 
 def _migrate_schema() -> None:
     """Add columns introduced after the initial release, so an existing
-    timelapse.db from before ftp_batch mode still loads correctly.
+    timelapse.db from before ftp_batch mode (or before per-file sequential
+    upload) still loads correctly.
     """
     with engine.connect() as conn:
-        existing_cols = {
+        config_cols = {
             row[1] for row in conn.exec_driver_sql("PRAGMA table_info(config)")
         }
-        if "capture_mode" not in existing_cols:
+        if "capture_mode" not in config_cols:
             conn.exec_driver_sql(
                 "ALTER TABLE config ADD COLUMN capture_mode VARCHAR DEFAULT 'http_poll'",
             )
-        if "ftp_watch_dir" not in existing_cols:
+        if "ftp_watch_dir" not in config_cols:
             conn.exec_driver_sql(
                 "ALTER TABLE config ADD COLUMN ftp_watch_dir VARCHAR DEFAULT '/ftp_data'",
             )
+
+        # uploaded_capture only exists once an ftp_batch site has run at
+        # least once; skip on a fresh DB where create_all() already made it
+        # with every current column.
+        capture_cols = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(uploaded_capture)")
+        }
+        if capture_cols:
+            if "capture_date" not in capture_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE uploaded_capture ADD COLUMN capture_date VARCHAR",
+                )
+            if "sequence_number" not in capture_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE uploaded_capture ADD COLUMN sequence_number INTEGER",
+                )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_uploaded_capture_sequence_number "
+                "ON uploaded_capture (sequence_number)",
+            )
+
         conn.commit()
 
 
@@ -287,9 +331,9 @@ def _dropbox_month_folder(date_str: str) -> str:
 
 
 def _dropbox_path_for(dbx_folder: str, date_str: str, filename: str) -> str:
-    """Build the Dropbox destination path for one captured file. Batching
-    and upload-eligibility are still tracked per calendar day (date_str) —
-    only the destination folder is grouped by month.
+    """Build the Dropbox destination path for one captured file. Upload
+    happens per file, but the destination folder is still grouped by month
+    (derived from date_str, the file's capture date).
     """
     month_folder = _dropbox_month_folder(date_str)
     return str(Path(dbx_folder) / month_folder / filename).replace("\\", "/")
@@ -312,17 +356,31 @@ def _remove_empty_dirs(root: Path) -> None:
 
 
 def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
-    """Scan ftp_watch_dir for files from completed (non-today) days and
-    batch-upload any not already uploaded to Dropbox. Today's files are left
-    alone since that day's capture isn't finished yet. Designed to be called
-    on every tick of the main loop; it's a no-op once a day's files are
-    uploaded, verified, and deleted.
+    """Scan ftp_watch_dir for capture files and move each one through three
+    stages, in order, every time this is called (designed to run on every
+    tick of the main loop; a no-op once nothing is pending):
 
-    Once every file for a given day is uploaded, each one is verified as
-    actually present in Dropbox (files_get_metadata, not just "the upload
-    call didn't raise") before its local copy is deleted — the FTP landing
-    volume is finite storage on the Pi and needs to be reclaimed daily, but
-    deleting a capture that didn't really make it to Dropbox is unrecoverable.
+      1. Reserve — any file not seen before, whose mtime is at least
+         FTP_MIN_FILE_AGE_SECONDS old (so the camera's FTP client isn't
+         still mid-transfer on it), is assigned the next sequence number in
+         strict capture order and recorded with uploaded_at=None. This
+         happens *before* any upload is attempted, so a later-captured file
+         can never end up with a lower frame number than an earlier one
+         that's still retrying — the numbering is decided immediately, the
+         upload can lag behind it.
+      2. Upload — every reserved-but-not-yet-uploaded row is uploaded to
+         Dropbox as frame_<sequence_number>.jpg (oldest first). A failure
+         just leaves the row for next cycle to retry with the same number.
+      3. Verify + delete — every uploaded row whose local file is still on
+         disk is confirmed actually present in Dropbox (files_get_metadata,
+         not just "the upload call didn't raise") and then deleted locally.
+         The FTP landing volume is finite storage on the Pi and needs to be
+         reclaimed continuously, but deleting a capture that didn't really
+         make it to Dropbox is unrecoverable.
+
+    Sequence numbers keep climbing across day/month boundaries for the life
+    of the deployment, so the whole project can be imported into an editor
+    as one gap-free image sequence without any manual renaming.
     """
     watch_dir = Path(str(config.ftp_watch_dir))
     dbx_folder = str(config.dropbox_folder)
@@ -334,123 +392,154 @@ def _run_ftp_batch_cycle(config: Config, token: Token) -> None:
         )
         return
 
-    today = datetime.now(tz=APP_TIMEZONE).date()
-
+    now = datetime.now(tz=APP_TIMEZONE)
     local_session = Session()
     try:
-        already_uploaded = {
+        capture_files = {
+            str(p): p
+            for p in watch_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg")
+        }
+        if not capture_files:
+            update_status("No captures pending.", is_active=True)
+            return
+
+        known_paths = {
             row.file_path for row in local_session.query(UploadedCapture).all()
         }
 
-        # Group every completed-day file (uploaded or not) by date, so we can
-        # both upload new ones and re-check older days that uploaded fine
-        # last cycle but didn't get cleaned up (e.g. a crash between the two).
-        files_by_date: dict[str, list[Path]] = {}
-        for image_path in watch_dir.rglob("*"):
-            if (
-                not image_path.is_file()
-                or image_path.suffix.lower() not in (".jpg", ".jpeg")
-            ):
-                continue
-
-            file_date = datetime.fromtimestamp(
-                image_path.stat().st_mtime,
-                tz=APP_TIMEZONE,
-            ).date()
-            if file_date >= today:
-                # Still being written to by the capture source; wait for it to finish.
-                continue
-
-            files_by_date.setdefault(file_date.isoformat(), []).append(
-                image_path,
-            )
-
-        if not files_by_date:
+        # --- 1. Reserve: assign sequence numbers to newly-stable files, in
+        # strict capture order, before any upload is attempted.
+        new_files = sorted(
+            (
+                p
+                for key, p in capture_files.items()
+                if key not in known_paths
+                and now.timestamp() - p.stat().st_mtime >= FTP_MIN_FILE_AGE_SECONDS
+            ),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if new_files:
+            next_seq = (
+                local_session.query(
+                    func.max(UploadedCapture.sequence_number),
+                ).scalar()
+                or 0
+            ) + 1
+            for image_path in new_files:
+                capture_date = datetime.fromtimestamp(
+                    image_path.stat().st_mtime,
+                    tz=APP_TIMEZONE,
+                ).date().isoformat()
+                local_session.add(
+                    UploadedCapture(
+                        file_path=str(image_path),
+                        capture_date=capture_date,
+                        sequence_number=next_seq,
+                        uploaded_at=None,
+                    ),
+                )
+                local_session.commit()
+                next_seq += 1
             update_status(
-                "No completed day's captures pending upload.",
+                f"Reserved sequence numbers for {len(new_files)} new capture(s).",
                 is_active=True,
             )
-            return
 
-        # Get Dropbox Session (handles token refresh) only once real work exists.
-        dbx = get_dropbox_session(config, token)
+        dbx = None  # lazily created only once real work exists
 
-        for date_str, files in sorted(files_by_date.items()):
-            pending = [f for f in files if str(f) not in already_uploaded]
+        # --- 2. Upload: anything reserved but not yet uploaded, oldest first.
+        # sequence_number.isnot(None) excludes legacy rows created before this
+        # per-file pipeline existed (migrated in with sequence_number=NULL) --
+        # those predate frame numbering entirely and are intentionally left
+        # untouched, not retrofitted.
+        pending_rows = (
+            local_session.query(UploadedCapture)
+            .filter(
+                UploadedCapture.uploaded_at.is_(None),
+                UploadedCapture.sequence_number.isnot(None),
+            )
+            .order_by(UploadedCapture.sequence_number)
+            .all()
+        )
+        uploaded_count = 0
+        for row in pending_rows:
+            image_path = capture_files.get(row.file_path)
+            if image_path is None or not image_path.is_file():
+                continue  # reserved but the local file is gone; nothing to upload
 
-            if pending:
+            frame_name = f"frame_{row.sequence_number:0{FTP_SEQUENCE_DIGITS}d}.jpg"
+            dropbox_path = _dropbox_path_for(dbx_folder, row.capture_date, frame_name)
+
+            dbx = dbx or get_dropbox_session(config, token)
+            try:
+                dbx.files_upload(
+                    f=image_path.read_bytes(),
+                    path=dropbox_path,
+                    mode=dropbox.files.WriteMode.add,
+                )
+            except dropbox.exceptions.ApiError as e:
+                logger.exception(f"Dropbox upload failed for {image_path}")
                 update_status(
-                    f"Batch uploading {len(pending)} image(s) for {date_str}...",
+                    f"Dropbox Upload Error for {image_path.name}: {e}",
                     is_active=True,
                 )
-                uploaded_count = 0
-                for image_path in pending:
-                    dropbox_path = _dropbox_path_for(
-                        dbx_folder,
-                        date_str,
-                        image_path.name,
-                    )
-                    try:
-                        dbx.files_upload(
-                            f=image_path.read_bytes(),
-                            path=dropbox_path,
-                            mode=dropbox.files.WriteMode.add,
-                        )
-                        local_session.add(
-                            UploadedCapture(file_path=str(image_path)),
-                        )
-                        local_session.commit()
-                        already_uploaded.add(str(image_path))
-                        uploaded_count += 1
-                    except dropbox.exceptions.ApiError as e:
-                        logger.exception(f"Dropbox upload failed for {image_path}")
-                        update_status(
-                            f"Dropbox Upload Error for {image_path.name}: {e}",
-                            is_active=True,
-                        )
-                        # Leave unmarked so this file is retried on the next cycle.
+                continue  # retried next cycle with the same reserved number
 
-                status_msg = f"SUCCESS: Batch upload for {date_str} complete ({uploaded_count}/{len(pending)})."
-                update_status(status_msg, is_active=True)
-                logger.info(status_msg)
+            row.uploaded_at = datetime.now(timezone.utc)
+            local_session.commit()
+            uploaded_count += 1
 
-            if not all(str(f) in already_uploaded for f in files):
-                # At least one file for this day still isn't uploaded (a failure
-                # above, most likely) — don't touch local copies, retry next cycle.
+        if uploaded_count:
+            status_msg = f"SUCCESS: Uploaded {uploaded_count} new capture(s)."
+            update_status(status_msg, is_active=True)
+            logger.info(status_msg)
+
+        # --- 3. Verify + delete: anything uploaded whose local copy is
+        # still sitting on disk. Bounded to files currently in the watch
+        # dir, not every uploaded row ever, so this stays cheap for the
+        # life of a long deployment. sequence_number.isnot(None) excludes
+        # legacy pre-migration rows -- see Phase 2 comment above.
+        uploaded_rows = (
+            local_session.query(UploadedCapture)
+            .filter(
+                UploadedCapture.uploaded_at.isnot(None),
+                UploadedCapture.sequence_number.isnot(None),
+                UploadedCapture.file_path.in_(capture_files.keys()),
+            )
+            .all()
+        )
+        verified_deleted = 0
+        for row in uploaded_rows:
+            image_path = capture_files.get(row.file_path)
+            if image_path is None or not image_path.is_file():
                 continue
 
-            # Every file for this day is uploaded — verify each one actually
-            # exists in Dropbox, then delete the local copy to free up the
-            # Pi's storage before the next day's captures need the space.
-            verified_deleted = 0
-            for image_path in files:
-                dropbox_path = _dropbox_path_for(
-                    dbx_folder,
-                    date_str,
-                    image_path.name,
-                )
-                try:
-                    dbx.files_get_metadata(dropbox_path)
-                except dropbox.exceptions.ApiError:
-                    logger.exception(
-                        f"Verification failed for {image_path} at {dropbox_path}; "
-                        "not deleting, will re-check next cycle.",
-                    )
-                    continue
+            frame_name = f"frame_{row.sequence_number:0{FTP_SEQUENCE_DIGITS}d}.jpg"
+            dropbox_path = _dropbox_path_for(dbx_folder, row.capture_date, frame_name)
 
-                try:
-                    image_path.unlink()
-                    verified_deleted += 1
-                except OSError:
-                    logger.exception(f"Failed to delete local file {image_path}")
-
-            if verified_deleted:
-                status_msg = (
-                    f"Verified {verified_deleted}/{len(files)} image(s) for {date_str} "
-                    "in Dropbox and deleted the local copies."
+            dbx = dbx or get_dropbox_session(config, token)
+            try:
+                dbx.files_get_metadata(dropbox_path)
+            except dropbox.exceptions.ApiError:
+                logger.exception(
+                    f"Verification failed for {image_path} at {dropbox_path}; "
+                    "not deleting, will re-check next cycle.",
                 )
-                update_status(status_msg, is_active=True)
-                logger.info(status_msg)
+                continue
+
+            try:
+                image_path.unlink()
+                verified_deleted += 1
+            except OSError:
+                logger.exception(f"Failed to delete local file {image_path}")
+
+        if verified_deleted:
+            status_msg = (
+                f"Verified and deleted {verified_deleted} local capture(s)."
+            )
+            update_status(status_msg, is_active=True)
+            logger.info(status_msg)
 
         _remove_empty_dirs(watch_dir)
     finally:
@@ -461,12 +550,14 @@ def timelapse_job():
     """Run main background loop for fetching and uploading images."""
     logger.info("Timelapse background service started.")
 
-    while not stop_event.is_set():
-        # Retrieve config and token from the global session for the background job
-        config = db_session.query(Config).first()
-        token = db_session.query(Token).first()
+    interval = 300  # fallback if an exception hits before config is ever loaded
 
+    while not stop_event.is_set():
         try:
+            # Retrieve config and token from the global session for the background job
+            config = db_session.query(Config).first()
+            token = db_session.query(Token).first()
+
             if not config or not token:
                 raise Exception("Configuration or Token records are missing.")
             if token:
@@ -538,11 +629,12 @@ def timelapse_job():
                     logger.exception("Unknown Upload Error.")
 
         except Exception as e:
+            db_session.rollback()  # clear any half-open transaction so the next iteration's queries don't fail too
             update_status(
                 f"CRITICAL ERROR: {e}. Check configuration.",
                 is_active=True,
             )
-            logger.critical(f"CRITICAL ERROR in timelapse job: {e}")
+            logger.critical(f"CRITICAL ERROR in timelapse job: {e}", exc_info=True)
             stop_event.wait(5)
 
         # Wait for the defined interval, checking the stop_event periodically
