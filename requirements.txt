@@ -3,4 +3,4 @@ SQLAlchemy==2.0.52
 requests==2.34.2
 dropbox==12.2.1
 gunicorn==26.2.0
-python-dateutil==2.9.0.post0
+python-dateutil==3.0.0
